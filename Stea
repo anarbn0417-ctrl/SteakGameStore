@@ -1,0 +1,234 @@
+services:
+  - type: web
+    name: steakgamestore
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+
+const express=require("express");
+const fs=require("fs");
+const path=require("path");
+const crypto=require("crypto");
+const nodemailer=require("nodemailer");
+
+const app=express(), PORT=process.env.PORT||3000;
+const BASE_URL=process.env.BASE_URL||`http://localhost:${PORT}`;
+const DATA=path.join(__dirname,"data.json");
+app.use(express.json({limit:"2mb"}));
+app.use(express.static(path.join(__dirname,"public")));
+
+const read=()=>JSON.parse(fs.readFileSync(DATA,"utf8"));
+const write=d=>fs.writeFileSync(DATA,JSON.stringify(d,null,2));
+const id=prefix=>`${prefix}_${Date.now()}_${crypto.randomBytes(3).toString("hex")}`;
+const admin=(req,res,next)=>{
+  if(!process.env.ADMIN_KEY || req.headers["x-admin-key"]!==process.env.ADMIN_KEY)
+    return res.status(401).json({error:"Admin нэвтрэх шаардлагатай."});
+  next();
+};
+
+async function qpayToken(){
+  const host=process.env.QPAY_MODE==="production"?"https://merchant.qpay.mn":"https://merchant-sandbox.qpay.mn";
+  if(!process.env.QPAY_CLIENT_ID||!process.env.QPAY_CLIENT_SECRET) throw new Error("QPay credential тохируулаагүй.");
+  const basic=Buffer.from(`${process.env.QPAY_CLIENT_ID}:${process.env.QPAY_CLIENT_SECRET}`).toString("base64");
+  const r=await fetch(`${host}/v2/auth/token`,{method:"POST",headers:{Authorization:`Basic ${basic}`}});
+  const j=await r.json(); if(!r.ok) throw new Error(j.message||"QPay token error");
+  return {host,...j};
+}
+
+async function sendMail(to,subject,html){
+  if(!process.env.SMTP_HOST) return false;
+  const transporter=nodemailer.createTransport({
+    host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),
+    secure:String(process.env.SMTP_SECURE)==="true",
+    auth:{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}
+  });
+  await transporter.sendMail({from:process.env.MAIL_FROM,to,subject,html});
+  return true;
+}
+
+async function fulfill(order){
+  const db=read();
+  const o=db.orders.find(x=>x.id===order.id);
+  if(!o || o.status==="FULFILLED") return o;
+  const available=db.codes.filter(c=>c.productId===o.productId&&c.status==="AVAILABLE").slice(0,o.quantity);
+  if(available.length<o.quantity){
+    o.status="PAID_STOCK_WAIT";
+    write(db); return o;
+  }
+  o.codes=available.map(c=>c.code);
+  available.forEach(c=>{c.status="SOLD";c.orderId=o.id;c.soldAt=new Date().toISOString();});
+  o.status="FULFILLED"; o.fulfilledAt=new Date().toISOString();
+  write(db);
+  try{
+    await sendMail(o.email,`SteakGameStore — ${o.productName}`,
+      `<h2>Таны захиалга бэлэн боллоо</h2><p>Захиалга: <b>${o.id}</b></p><p>Бүтээгдэхүүн: ${o.productName}</p><p>Таны code:</p><pre style="font-size:20px">${o.codes.join("\\n")}</pre><p>Мөн дараах хуудсаас дахин харах боломжтой: ${BASE_URL}/order/${o.id}</p>`);
+    const d=read(), oo=d.orders.find(x=>x.id===o.id); if(oo)oo.emailSent=true; write(d);
+  }catch(e){ console.error("mail:",e.message); }
+  return o;
+}
+
+app.get("/api/config",(req,res)=>res.json({storeName:process.env.STORE_NAME||"SteakGameStore",qpayConfigured:!!(process.env.QPAY_CLIENT_ID&&process.env.QPAY_CLIENT_SECRET&&process.env.QPAY_INVOICE_CODE)}));
+app.get("/api/products",(req,res)=>res.json(read().products.filter(p=>p.active)));
+
+app.post("/api/orders",async(req,res)=>{
+ try{
+  const {productId,quantity=1,email,playerId="",option=""}=req.body, db=read();
+  const p=db.products.find(x=>x.id===productId&&x.active);
+  const qty=Math.max(1,Math.min(20,Number(quantity)||1));
+  if(!p)return res.status(404).json({error:"Бараа олдсонгүй."});
+  if(!email||!/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(email))return res.status(400).json({error:"Имэйл буруу байна."});
+  const codeStock=db.codes.filter(c=>c.productId===p.id&&c.status==="AVAILABLE").length;
+  if(p.stockType==="CODE"&&codeStock<qty)return res.status(400).json({error:"Энэ бараа түр дууссан байна."});
+  const o={id:id("SGS"),productId:p.id,productName:p.name,quantity:qty,amount:p.price*qty,email,playerId,option,status:"PENDING",createdAt:new Date().toISOString()};
+  if(process.env.QPAY_CLIENT_ID&&process.env.QPAY_CLIENT_SECRET&&process.env.QPAY_INVOICE_CODE){
+    const t=await qpayToken();
+    const payload={
+      invoice_code:process.env.QPAY_INVOICE_CODE,sender_invoice_no:o.id,
+      invoice_receiver_code:process.env.QPAY_INVOICE_RECEIVER_CODE||"",
+      invoice_description:`SteakGameStore - ${p.name}`,amount:o.amount,
+      callback_url:process.env.QPAY_CALLBACK_URL||`${BASE_URL}/api/qpay/callback`,
+      allow_partial:false,allow_exceed:false,sender_branch_code:"MAIN",
+      invoice_receiver_data:[{name:"Email",value:email},...(playerId?[{name:"Player ID",value:playerId}]:[])],
+      lines:[{tax_product_code:"",line_description:p.name,line_quantity:qty,line_unit_price:p.price,note:o.id}]
+    };
+    const r=await fetch(`${t.host}/v2/invoice`,{method:"POST",headers:{Authorization:`Bearer ${t.access_token}`,"Content-Type":"application/json"},body:JSON.stringify(payload)});
+    const j=await r.json(); if(!r.ok)return res.status(502).json({error:"QPay invoice үүссэнгүй.",detail:j});
+    Object.assign(o,{qpayInvoiceId:j.invoice_id,qrText:j.qr_text,qrImage:j.qr_image,urls:j.urls||[]});
+  }else{o.demo=true;o.qrText=`DEMO-${o.id}`;}
+  db.orders.push(o);write(db);
+  res.json({orderId:o.id,status:o.status,amount:o.amount,qrImage:o.qrImage||null,qrText:o.qrText||null,urls:o.urls||[],demo:!!o.demo});
+ }catch(e){console.error(e);res.status(500).json({error:e.message});}
+});
+
+app.get("/api/orders/:id",(req,res)=>{
+ const o=read().orders.find(x=>x.id===req.params.id);
+ if(!o)return res.status(404).json({error:"Захиалга олдсонгүй."});
+ res.json({orderId:o.id,status:o.status,amount:o.amount,productName:o.productName,codes:o.status==="FULFILLED"?o.codes:undefined,emailSent:o.emailSent||false});
+});
+
+app.post("/api/qpay/callback",async(req,res)=>{
+ try{
+  const db=read(), inv=req.body.invoice_id||req.body.invoiceId;
+  const o=db.orders.find(x=>x.qpayInvoiceId===inv||x.id===req.body.sender_invoice_no);
+  if(!o)return res.json({success:true});
+  const t=await qpayToken();
+  const r=await fetch(`${t.host}/v2/payment/check`,{method:"POST",headers:{Authorization:`Bearer ${t.access_token}`,"Content-Type":"application/json"},body:JSON.stringify({object_type:"INVOICE",object_id:o.qpayInvoiceId})});
+  const j=await r.json();
+  if(r.ok&&Number(j.count||0)>0){
+    const d=read(), oo=d.orders.find(x=>x.id===o.id);
+    if(oo.status!=="FULFILLED"){oo.status="PAID";oo.paidAt=new Date().toISOString();write(d);await fulfill(oo);}
+  }
+  res.json({success:true});
+ }catch(e){console.error(e);res.json({success:false});}
+});
+
+app.post("/api/demo/pay/:id",async(req,res)=>{
+ const db=read(),o=db.orders.find(x=>x.id===req.params.id);
+ if(!o||!o.demo)return res.status(404).json({error:"Demo order олдсонгүй."});
+ o.status="PAID";o.paidAt=new Date().toISOString();write(db);const done=await fulfill(o);res.json({success:true,status:done.status,codes:done.codes||[]});
+});
+
+// Admin dashboard API
+app.get("/api/admin/stats",admin,(req,res)=>{
+ const d=read(), orders=d.orders;
+ res.json({
+  products:d.products.length,
+  activeProducts:d.products.filter(p=>p.active).length,
+  availableCodes:d.codes.filter(c=>c.status==="AVAILABLE").length,
+  orders:orders.length,
+  paid:orders.filter(o=>["PAID","FULFILLED"].includes(o.status)).length,
+  revenue:orders.filter(o=>["PAID","FULFILLED"].includes(o.status)).reduce((a,o)=>a+o.amount,0)
+ });
+});
+app.get("/api/admin/products",admin,(req,res)=>res.json(read().products));
+app.post("/api/admin/products",admin,(req,res)=>{
+ const d=read(),p=req.body;
+ if(!p.name||!Number(p.price))return res.status(400).json({error:"name, price шаардлагатай"});
+ const x={id:p.id||id("prod"),category:p.category||"Other",name:p.name,price:Number(p.price),image:p.image||"🎮",stockType:"CODE",region:p.region||"Global",active:p.active!==false,description:p.description||""};
+ d.products.push(x);write(d);res.json(x);
+});
+app.patch("/api/admin/products/:id",admin,(req,res)=>{
+ const d=read(),p=d.products.find(x=>x.id===req.params.id);if(!p)return res.status(404).json({error:"not found"});
+ Object.assign(p,req.body);if(p.price)p.price=Number(p.price);write(d);res.json(p);
+});
+app.delete("/api/admin/products/:id",admin,(req,res)=>{
+ const d=read(),p=d.products.find(x=>x.id===req.params.id);if(!p)return res.status(404).json({error:"not found"});
+ p.active=false;write(d);res.json({success:true});
+});
+app.post("/api/admin/codes/import",admin,(req,res)=>{
+ const d=read(),{productId,codes}=req.body;
+ if(!d.products.some(p=>p.id===productId))return res.status(400).json({error:"Бүтээгдэхүүн олдсонгүй."});
+ const list=String(codes||"").split(/\\r?\\n|,|;/).map(x=>x.trim()).filter(Boolean);
+ const existing=new Set(d.codes.map(c=>c.code));let added=0;
+ for(const code of list)if(!existing.has(code)){d.codes.push({id:id("code"),productId,code,status:"AVAILABLE",createdAt:new Date().toISOString()});added++;}
+ write(d);res.json({added});
+});
+app.get("/api/admin/codes",admin,(req,res)=>{
+ const d=read();res.json(d.codes.map(c=>({...c,code:c.status==="SOLD"?c.code:c.code})));
+});
+app.get("/api/admin/orders",admin,(req,res)=>res.json(read().orders.sort((a,b)=>b.createdAt.localeCompare(a.createdAt))));
+app.post("/api/admin/orders/:id/fulfill",admin,async(req,res)=>{
+ const o=read().orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({error:"not found"});
+ const done=await fulfill(o);res.json(done);
+});
+
+app.get("/order/:id",(req,res)=>res.sendFile(path.join(__dirname,"public","order.html")));
+app.get("/admin",(req,res)=>res.sendFile(path.join(__dirname,"public","admin","index.html")));
+app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"public","index.html")));
+app.listen(PORT,()=>console.log(`SteakGameStore: ${BASE_URL}`));
+
+{
+  "name": "steakgamestore-full",
+  "version": "2.0.0",
+  "private": true,
+  "description": "SteakGameStore full digital gift card store with QPay and admin code inventory",
+  "scripts": {"start": "node server.js"},
+  "engines": {"node": ">=20"},
+  "dependencies": {
+    "express": "^5.1.0",
+    "nodemailer": "^7.0.6"
+  }
+}
+# SteakGameStore — Deploy
+
+## Render
+1. Upload this project to GitHub.
+2. Render → New → Web Service → select the GitHub repo.
+3. Build command: `npm install`
+4. Start command: `npm start`
+5. Add environment variables from `.env.example`.
+6. Set `BASE_URL` and `QPAY_CALLBACK_URL` to your Render/custom-domain HTTPS URL.
+
+## Required production variables
+- `BASE_URL`
+- `QPAY_MODE=production`
+- `QPAY_CLIENT_ID`
+- `QPAY_CLIENT_SECRET`
+- `QPAY_INVOICE_CODE`
+- `QPAY_INVOICE_RECEIVER_CODE`
+- `QPAY_CALLBACK_URL`
+- `ADMIN_KEY`
+
+Do not commit `.env` or QPay secrets to GitHub.
+
+## Important
+`data.json` is simple file storage for demo/small testing. Before taking real orders at scale, migrate products, orders and codes to PostgreSQL and use transaction-safe code allocation.
+
+{
+  "settings":{"currency":"₮","brand":"SteakGameStore"},
+  "products":[
+    {"id":"steam-10-us","category":"Steam","name":"Steam Wallet $10","price":35000,"image":"🎮","stockType":"CODE","region":"USA","active":true,"description":"Steam Wallet USA region digital code."},
+    {"id":"valorant-475","category":"Valorant","name":"Valorant 475 VP","price":22000,"image":"⚡","stockType":"CODE","region":"Global","active":true,"description":"Valorant Points digital code."},
+    {"id":"roblox-800","category":"Roblox","name":"Roblox 800 Robux","price":28000,"image":"🧱","stockType":"CODE","region":"Global","active":true,"description":"Roblox digital gift code."},
+    {"id":"pubgm-global","category":"PUBG Mobile","name":"PUBG Mobile Redeem Code","price":30000,"image":"🔫","stockType":"CODE","region":"Global","active":true,"description":"PUBG Mobile redeem code."}
+  ],
+  "codes":[
+    {"id":"c1","productId":"steam-10-us","code":"DEMO-STEAM-10-001","status":"AVAILABLE","createdAt":"2026-01-01T00:00:00Z"},
+    {"id":"c2","productId":"steam-10-us","code":"DEMO-STEAM-10-002","status":"AVAILABLE","createdAt":"2026-01-01T00:00:00Z"},
+    {"id":"c3","productId":"valorant-475","code":"DEMO-VAL-475-001","status":"AVAILABLE","createdAt":"2026-01-01T00:00:00Z"},
+    {"id":"c4","productId":"roblox-800","code":"DEMO-ROBLOX-800-001","status":"AVAILABLE","createdAt":"2026-01-01T00:00:00Z"},
+    {"id":"c5","productId":"pubgm-global","code":"DEMO-PUBGM-001","status":"AVAILABLE","createdAt":"2026-01-01T00:00:00Z"}
+  ],
+  "orders":[]
+}
